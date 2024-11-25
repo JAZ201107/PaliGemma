@@ -53,7 +53,7 @@ def test_inference(
             pixel_values=pixel_values,
             attention_mask=attention_mask,
             kv_cache=kv_cache,
-        )
+        )  # At begin, prefilling the cache
         kv_cache = outputs["kv_cache"]
         next_token_logits = outputs["logits"][:, -1, :]
         # Sample the next token
