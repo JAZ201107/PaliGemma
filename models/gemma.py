@@ -348,7 +348,6 @@ class GemmaModel(nn.Module):
         kv_caches: Optional[KVCache] = None,
     ) -> torch.FloatTensor:
         hidden_states = inputs_embeds
-
         normalizer = torch.tensor(
             self.config.hidden_size**0.5, dtype=hidden_states.dtype
         )
@@ -359,6 +358,7 @@ class GemmaModel(nn.Module):
             hidden_states = l(hidden_states, attention_mask, position_ids, kv_caches)
 
         hidden_states = self.norm(hidden_states)
+
         return hidden_states
 
 
@@ -385,14 +385,14 @@ class GemmaForCausalLM(nn.Module):
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple:
 
-        output = self.model(
+        outputs = self.model(
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             kv_cache=kv_cache,
         )
 
-        hidden_states = output
+        hidden_states = outputs
         logits = self.lm_head(hidden_states)
         logits = logits.float()
 

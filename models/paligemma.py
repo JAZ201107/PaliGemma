@@ -17,9 +17,11 @@ class PaliGemmaConfig:
     image_token_index: int = 256000
     vocab_size: int = 257152
     projection_dim: int = 2048
-    hidden_size: int = 2048 (
-            SiglipVisionConfig(**self.vision_config) if self.vision_config else None
-        )
+    hidden_size: int = 2048(
+        SiglipVisionConfig(**self.vision_config) if self.vision_config else None
+    )
+
+    def __post_init__(self):
         self.text_config = (
             GemmaConfig(**self.text_config, pad_token_id=self.pad_token_id)
             if self.text_config
@@ -83,12 +85,18 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         attention_mask: torch.Tensor,
         kv_cache: Optional[KVCache] = None,
     ):
+        """
+        Merge the input_ids with the image features,
+        1. Replace <image> token in `input_embed` with the actual image features `image_features`
+
+        """
         # Extract information from the input
         _, _, embed_dim = image_features.shape  # Image
         batch_size, sequence_length = input_ids.shape  # Text + Image
         dtype, device = inputs_embed.dtype, inputs_embed.device
 
         # Scale image features
+        # Why: To make the dot product between image and text embedding to be in the same scale
         scaled_image_features = image_features / (self.config.hidden_size**0.5)
 
         # Create Final embedding, which is the concat of  image embedding and text embedding
@@ -106,7 +114,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         image_mask = input_ids == self.config.image_token_index
         pad_mask = input_ids == self.pad_token_id
 
-        # (B, S) -> (B, S, E)
+        # (B, S) -> (B, S, 1)  -> (B, S, E)
         # Expand the mask to the same shape as the final_embedding
         text_mask_expanded = text_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
         pad_mask_expanded = pad_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
@@ -117,26 +125,34 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         final_embedding = torch.where(
             text_mask_expanded, inputs_embed, final_embedding
         )  # If text mask is 1, copy from the inputs_embed, else keep same
+
         # image_mask_expanded shape: (B, S, E)
         # scaled_image_features shape: (B, num_image_tokens( less than S) ,E)
         # So we need `masked_scatter``
-        
         num_true_values = image_mask_expanded.sum().item()
         num_source_elements = scaled_image_features.numel()
-        assert num_true_values == num_source_elements, "Mismatch between mask and source tensor sizes"
-        
-        final_embedding = final_embedding.masked_scatter(image_mask_expanded, scaled_image_features)
+        assert (
+            num_true_values == num_source_elements
+        ), "Mismatch between mask and source tensor sizes"
+
+        final_embedding = final_embedding.masked_scatter(
+            image_mask_expanded, scaled_image_features
+        )
         final_embedding = torch.where(
             pad_mask_expanded, torch.zeros_like(final_embedding), final_embedding
         )
         # ==== End Apply Mask =====
 
-        # ==== Create attention mask ==== 
+        # ==== Create attention mask ====
         # min_dtype = torch.finfo(dtype).min
+
         q_len = inputs_embed.shape[1]
 
         if kv_cache is None or kv_cache.num_items() == 0:
             # KV cache is not created or KV cache  is empty
+            # Prefill phase: store KV pairs of prompt tokens in ceche
+            # to be used in the next forward pass
+            # This is the prefix attention mask
             causal_mask = torch.full(
                 (batch_size, q_len, q_len), fill_value=0, dtype=dtype, device=device
             )
@@ -156,16 +172,21 @@ class PaliGemmaForConditionalGeneration(nn.Module):
 
         # ==== Generate position id ====
         if kv_cache is not None and kv_cache.num_items() > 0:
+            #  During the prefill phase,
+            # We need to generate the position id for the query token
+            # TODO: The position id is the length of the cache
             position_ids = attention_mask.cumsum(-1)[:, -1]
             if position_ids.dim() == 1:
                 position_ids = position_ids.unsqueeze(0)
         else:
+            # Create a position_ids based on the size of the attention_mask
+            # For masked tokens, use the number 1 as position.
             position_ids = (
                 (attention_mask.cumsum(-1))
                 .masked_fill_((attention_mask == 0), 1)
                 .to(device)
             )
-            
+
         return final_embedding, causal_mask, position_ids
 
     def forward(
@@ -177,14 +198,18 @@ class PaliGemmaForConditionalGeneration(nn.Module):
     ) -> Tuple:
         assert torch.all(attention_mask == 1), "The input cannot be padded"
 
+        # (B, S) => (B, S, E)
         inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
         # The <image> tokens in the embedding is not the correct image embeddings
         # Need to be replaced by the actual embedding through Vision Encoder
 
         # Get the actual image embedding
+        # (B, C, H, W) -> (B, Num_Patches, Embed_Dim )
         selected_image_features = self.vision_tower(
             pixel_values.to(inputs_embeds.dtype)
         )
+        # Project the image embedding to the text embedding space
+        # (B, Num_Patches, Embed_Dim ) -> (B, Num_Patches, E )
         image_features = self.multi_model_projector(selected_image_features)
 
         # Merge Tokens
